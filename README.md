@@ -87,4 +87,5 @@ python dynamic_pricing_mdp.py
 
 ## references
 [Aditya Mahaja ECSE 506](https://adityam.github.io/stochastic-control/mdps/intro.html#exercises)
+
 [Risk-averse dynamic pricing using mean-semivariance optimization](https://www.sciencedirect.com/science/article/pii/S0377221723002710?via%3Dihub#absh001)
