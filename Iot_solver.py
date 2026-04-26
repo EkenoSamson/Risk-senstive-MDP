@@ -1,35 +1,13 @@
 """
-solve.py — IoT Age-of-Information MDP (Exercise 5.4)
-=====================================================
-State   : S_t = X_t - Z_t  in {-B, ..., B}
-Action  : A_t in {0, 1}     (0 = no transmit, 1 = transmit)
-Noise   : W_t in {-5,...,5}, P(W=w) = 1/5 - |w|/25
+Iot_solver.py — IoT Age-of-Information MDP
 
-Dynamics
-    A_t = 0 :  S_{t+1} = clip(S_t + W_t, -B, B)
-    A_t = 1 :  S_{t+1} = clip(W_t,       -B, B)
-
-Per-step cost:  c(s, a) = lambda * a + (1 - a) * s^2
-
-Parts solved
-    a  Backward induction  (T=20, lambda=100, B=100)
-    b  Value functions for t in {1, 5, 10, 19}
-    c  Optimal policies    for t in {1, 5, 10, 19}
-    d  Boundary sensitivity B in {50, 60, 70, 80, 100}
-
-Dependencies: numpy, matplotlib, scipy
-Run        : python solve.py
-Outputs    : plots/iot_value_policy.png
-             plots/iot_threshold.png
-             plots/iot_B_sensitivity.png
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-# from scipy.optimize import linprog
 import os
 
-# ── Global style ───────────────────────────────────────────────────
+# ── Global style ────────────────────────────────────────────────────
 plt.rcParams.update({
     'font.family':     'serif',
     'font.size':       11,
@@ -56,40 +34,44 @@ PW /= PW.sum()
 # ══════════════════════════════════════════════════════════════════
 
 def sigma_EV(v, P, **kw):
-    """Expected value — risk neutral.  O(N^2)."""
+    """
+    Expected value — risk neutral.
+    sigma_i = sum_j p_ij * v_j
+    Complexity: O(N^2) via matrix-vector product.
+    """
     return P @ v
 
 
 def sigma_CVaR(v, P, alpha=0.3, **kw):
     """
-    Conditional CVaR at level alpha via direct quantile computation.
+    CVaR risk transition mapping via the dual (adversarial kernel) form.
 
-    For each state i:
-        sigma_i = min_theta { theta + (1/alpha) * sum_j p_ij * (v_j - theta)_+ }
-
-    The optimal theta is the (1-alpha)-quantile of v under p_i.
-    Found by sorting v and walking the cumulative weight. O(N log N) per state.
+    Complexity: O(N log N) per state (dominated by the sort, done once).
+    Total: O(T * N^2 * log N) — no LP solver needed.
     """
     N = len(v)
     result = np.zeros(N)
-    order = np.argsort(v)          # sort once, reuse across all rows
-    v_sorted = v[order]
+    order = np.argsort(-v)          # sort descending once, reuse for all rows
+
     for i in range(N):
-        pp = P[i][order]
-        cumw = np.cumsum(pp)
-        # theta* = smallest v_j such that P(v <= v_j) >= 1 - alpha
-        idx = np.searchsorted(cumw, 1.0 - alpha)
-        idx = min(idx, N - 1)
-        theta = v_sorted[idx]
-        result[i] = theta + (1.0 / alpha) * float(
-            pp @ np.maximum(v_sorted - theta, 0.0)
-        )
+        p = P[i]
+        remaining = 1.0
+        val = 0.0
+        for j in order:
+            mass = min(p[j] / alpha, remaining)
+            val += mass * v[j]
+            remaining -= mass
+            if remaining <= 1e-12:
+                break
+        result[i] = val
+
     return result
 
 
 def sigma_MSD(v, P, kappa=1.0, **kw):
     """
     Mean-semideviation (r=1).
+
         sigma_i = E[v | s_i] + kappa * E[(v - E[v|s_i])_+ | s_i]
 
     Complexity: O(N^2).
@@ -97,7 +79,7 @@ def sigma_MSD(v, P, kappa=1.0, **kw):
     N = len(v)
     result = np.zeros(N)
     for i in range(N):
-        mu = float(P[i] @ v)
+        mu  = float(P[i] @ v)
         pen = float(P[i] @ np.maximum(v - mu, 0.))
         result[i] = mu + kappa * pen
     return result
@@ -109,8 +91,11 @@ def sigma_MSD(v, P, kappa=1.0, **kw):
 
 def build_transition(B):
     """
-    P0, P1 — transition matrices for actions 0 and 1.
+    Build P0, P1 — transition matrices for actions 0 and 1.
     States : {-B, ..., B},  N = 2B+1.
+
+    Because noise support is [-5, 5] and is bounded, each row of P0
+    and P1 has at most 11 nonzero entries regardless of N.
     """
     states = np.arange(-B, B + 1)
     N      = len(states)
@@ -128,25 +113,36 @@ def build_transition(B):
 
 
 # ══════════════════════════════════════════════════════════════════
-# Backward induction — parts a, b, c
+# Backward induction  (Theorem 2 of Ruszczyński 2010)
 # ══════════════════════════════════════════════════════════════════
 
 def backward_induction(sigma_fn, B=100, T=20, lam=100, **kw):
     """
-    Finite-horizon risk-averse Bellman equations (Theorem 2).
+    Finite-horizon risk-averse Bellman equations.
+
+    v_{T+1}(s) = 0
+    v_t(s)     = min_{a in {0,1}} { c(s,a) + sigma(v_{t+1}, s, P^a(s,·)) }
+
+    Parameters
+    ----------
+    sigma_fn : callable  — one of sigma_EV, sigma_CVaR, sigma_MSD
+    B        : int       — state space truncation boundary
+    T        : int       — horizon
+    lam      : float     — transmission cost lambda
+    **kw                 — passed through to sigma_fn (e.g. alpha, kappa)
 
     Returns
     -------
     states : ndarray (N,)
-    V      : ndarray (T+1, N)   V[t] = value function at array index t
-    pol    : ndarray (T, N)     pol[t, i] = optimal action in state i at t
+    V      : ndarray (T+1, N)   V[t] = value function at time index t
+    pol    : ndarray (T, N)     pol[t, i] = optimal action at state i, time t
     """
-    states = np.arange(-B, B + 1)
-    N      = len(states)
-    P0, P1 = build_transition(B)
+    states  = np.arange(-B, B + 1)
+    N       = len(states)
+    P0, P1  = build_transition(B)
 
-    c0 = states ** 2
-    c1 = np.full(N, float(lam))
+    c0 = states ** 2               # cost of not transmitting
+    c1 = np.full(N, float(lam))   # cost of transmitting
 
     V   = np.zeros((T + 1, N))
     pol = np.zeros((T,     N), dtype=int)
@@ -161,7 +157,7 @@ def backward_induction(sigma_fn, B=100, T=20, lam=100, **kw):
 
 
 # ══════════════════════════════════════════════════════════════════
-# Plotting — parts b, c, d
+# Plotting
 # ══════════════════════════════════════════════════════════════════
 
 PLOT_TIMES = [1, 5, 10, 19]
@@ -172,7 +168,7 @@ def _t_indices(T, times):
 
 
 def plot_value_and_policy(states, V_ev, pol_ev, V_cv, pol_cv, T=20):
-    """Parts b & c: value functions and policies for EV and CVaR."""
+    """Value functions and policies for EV and CVaR."""
     t_idx = _t_indices(T, PLOT_TIMES)
     blues = plt.cm.Blues(np.linspace(0.40, 0.90, len(PLOT_TIMES)))
     reds  = plt.cm.Reds( np.linspace(0.40, 0.90, len(PLOT_TIMES)))
@@ -184,8 +180,8 @@ def plot_value_and_policy(states, V_ev, pol_ev, V_cv, pol_cv, T=20):
         fontsize=13)
 
     for k, (t, ti) in enumerate(zip(PLOT_TIMES, t_idx)):
-        axes[0, 0].plot(states, V_ev[ti],  color=blues[k], label=f't={t}')
-        axes[0, 1].plot(states, V_cv[ti],  color=reds[k],  label=f't={t}')
+        axes[0, 0].plot(states, V_ev[ti],   color=blues[k], label=f't={t}')
+        axes[0, 1].plot(states, V_cv[ti],   color=reds[k],  label=f't={t}')
         axes[1, 0].plot(states, pol_ev[ti], color=blues[k], label=f't={t}', lw=2)
         axes[1, 1].plot(states, pol_cv[ti], color=reds[k],  label=f't={t}', lw=2)
 
@@ -256,7 +252,7 @@ def plot_threshold(states, pol_ev, pol_cv, pol_ms, T=20):
 
 
 def plot_B_sensitivity(T=20, lam=100):
-    """Part d: vary B in {50,60,70,80,100} — EV value & policy at t=10."""
+    """Vary B in {50,60,70,80,100} — EV value and policy at t=10."""
     Bs     = [50, 60, 70, 80, 100]
     colors = plt.cm.viridis(np.linspace(0.0, 0.85, len(Bs)))
     ti     = T - 10
@@ -303,20 +299,20 @@ if __name__ == '__main__':
     print('  Expected Value ...')
     states, V_ev, pol_ev = backward_induction(sigma_EV,  B=B, T=T, lam=LAM)
 
-    print('  CVaR (alpha=0.3) ...')
+    print('  CVaR (alpha=0.3) — adversarial kernel ...')
     states, V_cv, pol_cv = backward_induction(sigma_CVaR, B=B, T=T, lam=LAM,
                                               alpha=0.3)
     print('  MSD (kappa=1.0) ...')
     states, V_ms, pol_ms = backward_induction(sigma_MSD,  B=B, T=T, lam=LAM,
                                               kappa=1.0)
 
-    print('\nPlotting value functions and policies (parts b & c) ...')
+    print('\nPlotting value functions and policies ...')
     plot_value_and_policy(states, V_ev, pol_ev, V_cv, pol_cv, T=T)
 
     print('Plotting transmission threshold ...')
     plot_threshold(states, pol_ev, pol_cv, pol_ms, T=T)
 
-    print('\nBoundary sensitivity (part d) ...')
+    print('\nBoundary sensitivity ...')
     plot_B_sensitivity(T=T, lam=LAM)
 
     print('\nAll done.')
