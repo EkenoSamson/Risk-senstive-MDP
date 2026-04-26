@@ -26,7 +26,7 @@ Outputs    : plots/iot_value_policy.png
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import linprog
+# from scipy.optimize import linprog
 import os
 
 # ── Global style ───────────────────────────────────────────────────
@@ -62,28 +62,28 @@ def sigma_EV(v, P, **kw):
 
 def sigma_CVaR(v, P, alpha=0.3, **kw):
     """
-    Conditional CVaR at level alpha.
+    Conditional CVaR at level alpha via direct quantile computation.
 
-    For each state i solves the LP:
-        min_theta  theta + (1/alpha) * sum_j p_ij * (v_j - theta)_+
+    For each state i:
+        sigma_i = min_theta { theta + (1/alpha) * sum_j p_ij * (v_j - theta)_+ }
 
-    Overall complexity: O(N^2 * LP_solve(N))
+    The optimal theta is the (1-alpha)-quantile of v under p_i.
+    Found by sorting v and walking the cumulative weight. O(N log N) per state.
     """
     N = len(v)
     result = np.zeros(N)
+    order = np.argsort(v)          # sort once, reuse across all rows
+    v_sorted = v[order]
     for i in range(N):
-        pp = P[i]
-        nz = pp > 0
-        vv, pp_nz = v[nz], pp[nz]
-        n = len(vv)
-        if n == 0:
-            continue
-        obj   = np.concatenate([[1.], pp_nz / alpha])
-        A_ub  = np.hstack([-np.ones((n, 1)), -np.eye(n)])
-        b_ub  = -vv
-        bounds = [(None, None)] + [(0., None)] * n
-        res = linprog(obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        result[i] = res.fun if res.success else float(np.dot(pp_nz, vv))
+        pp = P[i][order]
+        cumw = np.cumsum(pp)
+        # theta* = smallest v_j such that P(v <= v_j) >= 1 - alpha
+        idx = np.searchsorted(cumw, 1.0 - alpha)
+        idx = min(idx, N - 1)
+        theta = v_sorted[idx]
+        result[i] = theta + (1.0 / alpha) * float(
+            pp @ np.maximum(v_sorted - theta, 0.0)
+        )
     return result
 
 
