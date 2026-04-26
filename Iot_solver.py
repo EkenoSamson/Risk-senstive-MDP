@@ -34,56 +34,42 @@ PW /= PW.sum()
 # ══════════════════════════════════════════════════════════════════
 
 def sigma_EV(v, P, **kw):
-    """
-    Expected value — risk neutral.
-    sigma_i = sum_j p_ij * v_j
-    Complexity: O(N^2) via matrix-vector product.
-    """
+    """Expected value — risk neutral.  O(N^2)."""
     return P @ v
 
 
 def sigma_CVaR(v, P, alpha=0.3, **kw):
     """
-    CVaR risk transition mapping via the dual (adversarial kernel) form.
-
-    Complexity: O(N log N) per state (dominated by the sort, done once).
-    Total: O(T * N^2 * log N) — no LP solver needed.
+    CVaR via adversarial kernel — vectorised.
+    A(p_i) = { mu : 0 <= mu_j <= p_ij/alpha, sum_j mu_j = 1 }
+    Greedy allocation over sorted v, fully vectorised.
+    Complexity: O(N log N) dominated by sort.
     """
-    N = len(v)
-    result = np.zeros(N)
-    order = np.argsort(-v)          # sort descending once, reuse for all rows
+    order    = np.argsort(-v)
+    v_sorted = v[order]
+    P_sorted = P[:, order]
 
-    for i in range(N):
-        p = P[i]
-        remaining = 1.0
-        val = 0.0
-        for j in order:
-            mass = min(p[j] / alpha, remaining)
-            val += mass * v[j]
-            remaining -= mass
-            if remaining <= 1e-12:
-                break
-        result[i] = val
+    cap    = P_sorted / alpha
+    cumcap = np.cumsum(cap, axis=1)
 
-    return result
+    remaining = np.clip(
+        1.0 - np.concatenate([np.zeros((len(v), 1)), cumcap[:, :-1]], axis=1),
+        0., None)
+    mass = np.minimum(cap, remaining)
+
+    return (mass * v_sorted).sum(axis=1)
 
 
 def sigma_MSD(v, P, kappa=1.0, **kw):
     """
-    Mean-semideviation (r=1).
-
+    Mean-semideviation (r=1) — vectorised.
         sigma_i = E[v | s_i] + kappa * E[(v - E[v|s_i])_+ | s_i]
-
-    Complexity: O(N^2).
+    Complexity: O(N^2) via matrix operations.
     """
-    N = len(v)
-    result = np.zeros(N)
-    for i in range(N):
-        mu  = float(P[i] @ v)
-        pen = float(P[i] @ np.maximum(v - mu, 0.))
-        result[i] = mu + kappa * pen
-    return result
-
+    mu  = P @ v                              # shape (N,)
+    dev = np.maximum(v - mu[:, None], 0.)   # shape (N, N)
+    pen = (P * dev).sum(axis=1)             # shape (N,)
+    return mu + kappa * pen
 
 # ══════════════════════════════════════════════════════════════════
 # Transition matrices
